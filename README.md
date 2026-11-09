@@ -109,6 +109,23 @@ Models are downloaded once from Hugging Face and stored in
 you type is sent anywhere. To block all network use after the first
 download, set the environment variable `HF_HUB_OFFLINE=1`.
 
+## Adding a logo
+
+Save a PNG called `logo.png` in the `assets` folder (create the folder if it is
+missing). It then appears beside the page title and as the browser tab icon.
+A square image with a transparent background works best.
+
+## How the code is organized
+
+| File | What it does |
+|---|---|
+| `wiseacre.py` | Starts everything: reads the options, picks the models, opens the page |
+| `models.py` | Detects the hardware and holds the table of model tiers (edit it to try other models) |
+| `engine.py` | Loads the models and generates answers, with speculative decoding |
+| `store.py` | Remembered options and saved conversations |
+| `ui.py` | The chat page |
+| `tests/smoke_test.py` | Offline checks using tiny stand-in models |
+
 ## Licenses
 
 The code in this folder is MIT licensed (see `LICENSE`). The models are not
