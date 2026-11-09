@@ -1,0 +1,5 @@
+torch>=2.3
+transformers>=4.45
+accelerate>=0.30
+gradio>=5.0,<6
+psutil
