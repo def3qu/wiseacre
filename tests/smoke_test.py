@@ -90,6 +90,24 @@ def main():
     assert same_text[1]["speculative"] and same_text[0] == base_text
     print("1b. identical draft (full acceptance) matches baseline")
 
+    # Hitting the length limit is reported; finishing on its own is not.
+    cut_text, cut_stats = None, None
+    for cut_text, cut_stats in engine.stream(history, "", 5, 0.0, False):
+        pass
+    assert cut_stats["tokens"] == 5 and cut_stats["truncated"], cut_stats
+    assert "cut off at the length limit" in wiseacre.stats_line(cut_stats)
+    assert "cut off" not in wiseacre.stats_line({**cut_stats, "truncated": False})
+    # a finished answer (the model emits its end token) is not flagged
+    engine.eos_ids = {int(x) for x in range(engine.target.config.vocab_size)}
+    for _, done_stats in engine.stream(history, "", 5, 0.0, False):
+        pass
+    assert not done_stats["truncated"], done_stats
+    engine.eos_ids = {2}
+    # the note is removed again before the history goes back to the model
+    cleaned = wiseacre.clean_history([{"role": "assistant", "content": "partial" + wiseacre.stats_line(cut_stats)}])
+    assert cleaned[0]["content"] == "partial", cleaned
+    print("1c. cut-off answers are flagged and the note is stripped from history")
+
     torch.manual_seed(0)
     sampled_text, sampled_stats = run(0.7, True)
     assert sampled_stats and sampled_stats["speculative"]
@@ -103,18 +121,56 @@ def main():
     assert cleaned[1]["content"] == "answer text", cleaned
     print("3. speed line stripped from history")
 
-    ui = wiseacre.build_ui(engine, "test")
+    # Remembered options and saved conversations
+    store_dir = os.path.join(root, "home")
+    store = wiseacre.Store(store_dir)
+    assert store.load_settings() == wiseacre.DEFAULT_SETTINGS and not store.load_settings()["save_chats"]
+    store.save_settings({**wiseacre.DEFAULT_SETTINGS, "max_new": 2048, "system_prompt": "I teach C++."})
+    again = wiseacre.Store(store_dir).load_settings()
+    assert again["max_new"] == 2048 and again["system_prompt"] == "I teach C++."
+    with open(store.settings_file, "w") as f:
+        f.write("{ not json")
+    assert store.load_settings() == wiseacre.DEFAULT_SETTINGS       # damaged file: defaults
+    with open(store.settings_file, "w") as f:
+        f.write('{"max_new": "lots", "save_chats": 1}')
+    assert store.load_settings() == wiseacre.DEFAULT_SETTINGS       # wrong types ignored
+    print("6. options are remembered; damaged or odd settings files fall back to defaults")
+
+    msgs = [{"role": "user", "content": "Write 3 C++ problems!\nThanks"},
+            {"role": "assistant", "content": "1. Loops\n2. Pointers"}]
+    name = store.save_chat(None, msgs, "model-x")
+    assert name.endswith("_write-3-c-problems.json"), name
+    msgs.append({"role": "user", "content": "more"})
+    assert store.save_chat(name, msgs, "model-x") == name          # updates in place
+    assert store.save_chat(None, msgs[:1], "m").startswith(name[:16])  # new chat, new file
+    assert store.load_chat(name) == msgs
+    assert os.path.exists(os.path.join(store.chat_dir, name.replace(".json", ".md")))
+    labels = [label for label, _ in store.list_chats()]
+    assert len(labels) == 2 and "Write 3 C++ problems!" in labels[0] + labels[1], labels
+    for bad in ("../settings.json", "/etc/passwd", "x/../y.json", "nope.json", "", None):
+        assert store.load_chat(bad) is None, bad
+    with open(os.path.join(store.chat_dir, "broken.json"), "w") as f:
+        f.write("{ nope")
+    assert len(store.list_chats()) == 2                              # damaged file skipped
+    print("7. conversations save, update, list and reopen; unsafe names are refused")
+
+    ui = wiseacre.build_ui(engine, "test", store)
     assert ui is not None
-    print("4. web interface builds")
+    print("8. web interface builds")
 
     # Talk to the running web app the way a browser would
     from gradio_client import Client
     ui.queue().launch(server_name="127.0.0.1", prevent_thread_lock=True, quiet=True, share=False)
     try:
         client = Client(ui.local_url, verbose=False)
-        reply = client.predict("hello world", "You are helpful.", 64, 0.0, True, api_name="/chat")
-        assert isinstance(reply, str) and "tokens/s" in reply, reply
-        print("4b. web app answered end to end:", repr(reply[-60:]))
+        before = len(store.list_chats())
+        reply = client.predict("hello world", [], "You are helpful.", 64, 0.0, True, False, api_name="/chat")
+        history = reply[0]
+        assert history[-1]["role"] == "assistant" and "tokens/s" in history[-1]["content"], reply
+        assert len(store.list_chats()) == before, "saved a conversation although saving was off"
+        client.predict("hello world", [], "You are helpful.", 64, 0.0, True, True, api_name="/chat")
+        assert len(store.list_chats()) == before + 1, "did not save when saving was on"
+        print("9. web app answered end to end; saves only when the option is on")
     finally:
         ui.close()
 
@@ -124,7 +180,7 @@ def main():
                     for i in range(9)]
     ids = engine.build_input(long_history, "")
     assert ids.shape[1] <= 400
-    print("5. long histories are trimmed:", ids.shape[1], "tokens")
+    print("10. long histories are trimmed:", ids.shape[1], "tokens")
 
     print("\nALL CHECKS PASSED")
 

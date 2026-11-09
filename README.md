@@ -57,10 +57,37 @@ different sizes do.
 ## Using it
 
 Type a question and press Enter. Under each answer you will see the speed in
-tokens per second. The Settings panel lets you change the instructions given
-to the assistant, the maximum answer length, how creative it is, and whether
-speculative decoding is on. At creativity 0 the same question gives the same
-answer every time.
+tokens per second. Under the message box, open **Answer options** to change
+the instructions given to the assistant, the maximum answer length, how
+creative it is, and whether speculative decoding is on. At creativity 0 the
+same question gives the same answer every time.
+
+Answers stop at the maximum length (1024 tokens by default, roughly 700
+words), sometimes in the middle of a sentence or a code listing. When that
+happens the speed line says so. Type "continue" to keep going, or raise the
+limit in Answer options. Long requests, such as many homework problems at
+once, work better in smaller batches.
+
+## What it remembers
+
+Within one conversation it remembers everything you said earlier, up to about
+6000 tokens; in a very long chat the oldest messages are dropped. When you
+close the page or click **New chat**, the conversation is forgotten, and the
+model itself never learns from your chats.
+
+Two things can be kept on your computer, in a folder called `Wiseacre` inside
+your home folder (change it with `--data-dir`):
+
+- **Answer options** are remembered automatically: the instructions for the
+  assistant, answer length, creativity and the speculative decoding switch. A
+  standing instruction such as "I teach C++ to second-year students" in the
+  instructions box is used every time you start Wiseacre.
+- **Saved conversations** are off by default. Tick **Save my conversations on
+  this computer** under Saved conversations to turn them on. Each conversation
+  is then saved as two files in `Wiseacre/chats`: a `.md` file you can read in
+  any text editor, and a `.json` copy that Wiseacre reopens. Pick one from
+  **Reopen a saved conversation** and click Open to continue it. Delete the
+  files to remove a conversation.
 
 ## Options
 
@@ -71,6 +98,7 @@ answer every time.
 | `--no-speculative` | Skip the helper model (uses less memory) |
 | `--lan` | Let other computers on your network open the chat. Off by default; anyone on the network could then use it |
 | `--port 8000` | Use a different port |
+| `--data-dir PATH` | Keep remembered options and saved conversations somewhere other than `~/Wiseacre` |
 | `--no-browser` | Do not open the browser automatically |
 
 ## Privacy

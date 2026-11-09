@@ -17,11 +17,14 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
 import psutil
 import torch
@@ -50,7 +53,8 @@ TIERS = [
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 MAX_PROMPT_TOKENS = 6000      # older turns are dropped past this, to bound memory use
-DEFAULT_K = 5                 # tokens the draft model proposes per round
+DEFAULT_MAX_NEW = 1024        # default answer length limit, in tokens
+DEFAULT_K = 5                # tokens the draft model proposes per round
 STATS_MARK = "⏱"         # stopwatch; marks the speed line added under answers
 
 
@@ -141,6 +145,15 @@ class Engine:
         eos = self.tokenizer.eos_token_id
         self.pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else eos
 
+        # Every token id that means "the answer is finished", used to tell a
+        # finished answer from one cut off by the length limit.
+        self.eos_ids = {eos} if eos is not None else set()
+        gen_eos = self.target.generation_config.eos_token_id
+        if isinstance(gen_eos, int):
+            self.eos_ids.add(gen_eos)
+        elif gen_eos:
+            self.eos_ids.update(gen_eos)
+
     def _match_draft_to_target(self):
         """Make the draft's config agree with the target's.
 
@@ -181,7 +194,7 @@ class Engine:
 
         for speculative in attempts:
             streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
-            box = {"error": None, "n_new": 0}
+            box = {"error": None, "n_new": 0, "finished": True}
             started = time.perf_counter()
 
             thread = threading.Thread(
@@ -196,7 +209,10 @@ class Engine:
 
             if box["error"] is None:
                 elapsed = time.perf_counter() - started
-                yield text, {"tokens": box["n_new"], "seconds": elapsed, "speculative": speculative}
+                yield text, {
+                    "tokens": box["n_new"], "seconds": elapsed, "speculative": speculative,
+                    "truncated": box["n_new"] >= max_new and not box["finished"],
+                }
                 return
             if speculative and not text:
                 print(f"Speculative decoding failed ({box['error']}); continuing without it.", flush=True)
@@ -220,6 +236,7 @@ class Engine:
             with torch.no_grad():
                 out = self.target.generate(**kwargs)
             box["n_new"] = int(out.shape[1] - ids.shape[1])
+            box["finished"] = int(out[0, -1]) in self.eos_ids
         except Exception as e:  # reported to the caller; also unblocks the streamer
             box["error"] = e
             streamer.on_finalized_text("", stream_end=True)
@@ -232,6 +249,133 @@ class Engine:
         if self.speculative_ok:
             for _ in self.stream(history, "", 4, 0.0, True):
                 pass
+
+
+# ------------------------------------------------------------
+# Remembered options and saved conversations (all on this computer)
+# ------------------------------------------------------------
+
+DEFAULT_SETTINGS = {
+    "system_prompt": DEFAULT_SYSTEM_PROMPT,
+    "max_new": DEFAULT_MAX_NEW,
+    "temperature": 0.7,
+    "speculative": True,
+    "save_chats": False,   # saving conversations is opt-in
+}
+
+
+def _same_kind(value, default):
+    """True when a value read from the settings file has a sensible type."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, type(default))
+
+
+class Store:
+    """Remembers the options between runs and, only if the user turns it on,
+    saves conversations. Everything lives in one folder the user can open,
+    back up or delete. Nothing is ever sent anywhere."""
+
+    def __init__(self, root):
+        self.root = Path(root).expanduser()
+        self.settings_file = self.root / "settings.json"
+        self.chat_dir = self.root / "chats"
+
+    # -- options ----------------------------------------------------------
+
+    def load_settings(self):
+        settings = dict(DEFAULT_SETTINGS)
+        try:
+            saved = json.loads(self.settings_file.read_text(encoding="utf-8"))
+            for key, default in DEFAULT_SETTINGS.items():
+                if key in saved and _same_kind(saved[key], default):
+                    settings[key] = saved[key]
+        except (OSError, ValueError, AttributeError, TypeError):
+            pass  # missing or damaged file: use the defaults
+        return settings
+
+    def save_settings(self, settings):
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.settings_file.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        except OSError as e:
+            print(f"Could not save options: {e}", flush=True)
+
+    # -- conversations ----------------------------------------------------
+
+    def save_chat(self, filename, messages, model=""):
+        """Write a conversation, or update the one saved earlier. Returns its file name.
+        A readable .md copy is written next to the .json file the app reopens."""
+        self.chat_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now()
+        existing = self._read(filename) if filename else None
+        first_user = next((m["content"] for m in messages if m["role"] == "user"), "Conversation")
+        title = first_user.strip().splitlines()[0][:80] if first_user.strip() else "Conversation"
+
+        if not existing:
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40] or "chat"
+            base = f"{now:%Y-%m-%d_%H-%M}_{slug}"
+            filename, n = base + ".json", 2
+            while (self.chat_dir / filename).exists():
+                filename, n = f"{base}-{n}.json", n + 1
+
+        data = {
+            "title": title,
+            "created": existing["created"] if existing else now.isoformat(timespec="seconds"),
+            "updated": now.isoformat(timespec="seconds"),
+            "model": model,
+            "messages": messages,
+        }
+        path = self.chat_dir / filename
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        path.with_suffix(".md").write_text(self._markdown(data), encoding="utf-8")
+        return filename
+
+    def list_chats(self):
+        """(label, file name) pairs for a dropdown, newest first."""
+        choices = []
+        if not self.chat_dir.is_dir():
+            return choices
+        for path in sorted(self.chat_dir.glob("*.json"), reverse=True):
+            data = self._read(path.name)
+            if not data:
+                continue
+            try:
+                when = datetime.fromisoformat(data["created"]).strftime("%b %d, %H:%M")
+            except (KeyError, ValueError):
+                when = path.stem[:16]
+            choices.append((f"{when}   {data['title']}", path.name))
+        return choices
+
+    def load_chat(self, filename):
+        data = self._read(filename)
+        return data["messages"] if data else None
+
+    def _read(self, filename):
+        """Read one saved conversation, or None if it is missing, damaged or not ours."""
+        if not filename or Path(filename).name != filename or not filename.endswith(".json"):
+            return None  # only plain file names inside the chats folder are allowed
+        try:
+            data = json.loads((self.chat_dir / filename).read_text(encoding="utf-8"))
+            messages = data["messages"]
+            if not (isinstance(data["title"], str) and isinstance(data["created"], str)
+                    and isinstance(messages, list)):
+                return None
+            for m in messages:
+                if m["role"] not in ("user", "assistant") or not isinstance(m["content"], str):
+                    return None
+            return data
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    @staticmethod
+    def _markdown(data):
+        lines = [f"# {data['title']}", "", f"Saved {data['updated'].replace('T', ' ')}, model {data['model'] or 'unknown'}", ""]
+        for m in data["messages"]:
+            lines += ["**You**" if m["role"] == "user" else "**Wiseacre**", "", m["content"], ""]
+        return "\n".join(lines)
 
 
 # ------------------------------------------------------------
@@ -254,37 +398,111 @@ def clean_history(history):
 def stats_line(stats):
     rate = stats["tokens"] / stats["seconds"] if stats["seconds"] else 0
     mode = "speculative decoding on" if stats["speculative"] else "speculative decoding off"
-    return f"\n\n*{STATS_MARK} {stats['tokens']} tokens in {stats['seconds']:.1f} s ({rate:.1f} tokens/s), {mode}*"
+    line = f"{STATS_MARK} {stats['tokens']} tokens in {stats['seconds']:.1f} s ({rate:.1f} tokens/s), {mode}."
+    if stats.get("truncated"):
+        line += (" **This answer was cut off at the length limit.** "
+                 "Type “continue” to keep going, or raise the limit under Answer options.")
+    return f"\n\n*{line}*"
 
 
-def build_ui(engine, title):
+def build_ui(engine, title, store):
     import gradio as gr
 
-    def respond(message, history, system_prompt, max_new, temperature, use_speculative):
-        messages = clean_history(history) + [{"role": "user", "content": message}]
-        text = ""
-        for text, stats in engine.stream(messages, system_prompt, int(max_new), float(temperature), use_speculative):
-            if stats is None:
-                yield text
-            else:
-                yield text + stats_line(stats)
-
+    settings = store.load_settings()
     spec_available = engine.speculative_ok
-    extras = [
-        gr.Textbox(DEFAULT_SYSTEM_PROMPT, label="Instructions for the assistant", lines=2),
-        gr.Slider(64, 2048, value=512, step=64, label="Maximum answer length (tokens)"),
-        gr.Slider(0.0, 1.2, value=0.7, step=0.1,
-                  label="Creativity (0 = most predictable and repeatable)"),
-        gr.Checkbox(spec_available, label="Speculative decoding (faster answers, same quality)",
-                    interactive=spec_available),
-    ]
-    return gr.ChatInterface(
-        respond, type="messages", title=title,
-        description=("Runs entirely on this computer. Your conversation is not sent anywhere. "
-                     "Answers can be wrong, so check anything important."),
-        additional_inputs=extras, additional_inputs_accordion=gr.Accordion("Settings", open=False),
-        fill_height=True,
-    )
+    model_label = engine.target_name
+
+    def respond(message, history, system_prompt, max_new, temperature, use_spec, save_on, current):
+        message = (message or "").strip()
+        history = [{"role": m["role"], "content": m["content"]} for m in (history or [])]
+        if not message:
+            yield history, "", current, gr.update()
+            return
+
+        history.append({"role": "user", "content": message})
+        yield history + [{"role": "assistant", "content": "Thinking…"}], "", current, gr.update()
+
+        shown = ""
+        try:
+            for text, stats in engine.stream(
+                    clean_history(history), system_prompt, int(max_new), float(temperature), bool(use_spec)):
+                shown = text if stats is None else text + stats_line(stats)
+                yield history + [{"role": "assistant", "content": shown}], "", current, gr.update()
+        except Exception as e:  # show the problem in the chat instead of a blank page
+            shown = (shown + "\n\n" if shown else "") + f"*Something went wrong: {e}*"
+        history.append({"role": "assistant", "content": shown})
+
+        picker_update = gr.update()
+        if save_on:
+            try:
+                current = store.save_chat(current, clean_history(history), model_label)
+                picker_update = gr.update(choices=store.list_chats(), value=current)
+            except OSError as e:
+                history[-1]["content"] += f"\n\n*Could not save this conversation: {e}*"
+        yield history, "", current, picker_update
+
+    def persist(system_prompt, max_new, temperature, use_spec, save_on):
+        store.save_settings({
+            "system_prompt": system_prompt, "max_new": int(max_new), "temperature": float(temperature),
+            "speculative": bool(use_spec), "save_chats": bool(save_on),
+        })
+
+    def open_chat(filename):
+        messages = store.load_chat(filename)
+        if messages is None:
+            gr.Warning("That conversation could not be opened.")
+            return gr.update(), gr.update()
+        return messages, filename
+
+    def refresh():
+        return gr.update(choices=store.list_chats())
+
+    with gr.Blocks(title=title, css="footer {display: none !important}") as demo:
+        gr.Markdown(f"# {title}")
+        gr.Markdown("Runs entirely on this computer. Your conversation is not sent anywhere. "
+                    "Answers can be wrong, so check anything important.")
+        chatbot = gr.Chatbot(type="messages", height="55vh", show_copy_button=True, label="Conversation")
+        with gr.Row():
+            box = gr.Textbox(placeholder="Type a message and press Enter", show_label=False,
+                             scale=8, lines=1, max_lines=6, autofocus=True)
+            send = gr.Button("Send", variant="primary", scale=1, min_width=80)
+            new = gr.Button("New chat", scale=1, min_width=80)
+
+        with gr.Accordion("Answer options: length, creativity, instructions", open=False):
+            system_box = gr.Textbox(settings["system_prompt"], label="Instructions for the assistant", lines=2)
+            max_slider = gr.Slider(64, 4096, value=settings["max_new"], step=64,
+                                   label="Maximum answer length (tokens; about 3 tokens per 2 words)")
+            temp_slider = gr.Slider(0.0, 1.2, value=settings["temperature"], step=0.1,
+                                    label="Creativity (0 = most predictable and repeatable)")
+            spec_box = gr.Checkbox(settings["speculative"] and spec_available,
+                                   label="Speculative decoding (faster answers, same quality)",
+                                   interactive=spec_available)
+            gr.Markdown("These options are remembered the next time you start Wiseacre.")
+
+        with gr.Accordion("Saved conversations", open=False):
+            save_box = gr.Checkbox(settings["save_chats"], label="Save my conversations on this computer")
+            gr.Markdown(f"Off by default. When on, each conversation is saved in `{store.chat_dir}`, "
+                        "as a file you can read and a copy this page can reopen. "
+                        "Delete the files there to remove a conversation.")
+            with gr.Row():
+                picker = gr.Dropdown(choices=store.list_chats(), label="Reopen a saved conversation", scale=4)
+                open_btn = gr.Button("Open", scale=1, min_width=80)
+                refresh_btn = gr.Button("Refresh list", scale=1, min_width=80)
+
+        current = gr.State(None)  # file name of the conversation being saved
+
+        options = [system_box, max_slider, temp_slider, spec_box, save_box]
+        run = dict(fn=respond, inputs=[box, chatbot] + options + [current],
+                   outputs=[chatbot, box, current, picker], concurrency_limit=1)
+        box.submit(api_name="chat", **run)
+        send.click(api_name=False, **run)
+        new.click(lambda: ([], "", None), None, [chatbot, box, current], api_name=False)
+        open_btn.click(open_chat, picker, [chatbot, current], api_name=False)
+        refresh_btn.click(refresh, None, picker, api_name=False)
+        demo.load(refresh, None, picker, api_name=False)
+        for component in options:
+            component.change(persist, options, None, show_progress="hidden", api_name=False)
+    return demo
 
 
 # ------------------------------------------------------------
@@ -303,6 +521,8 @@ def main():
                         help="let other computers on your network open the chat (off by default)")
     parser.add_argument("--no-browser", action="store_true", help="do not open the browser automatically")
     parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--data-dir", default="~/Wiseacre",
+                        help="folder for remembered options and (if turned on) saved conversations")
     args = parser.parse_args()
 
     # Keep the console readable for non-programmers: show real problems only.
@@ -334,10 +554,12 @@ def main():
         engine.warm_up()
 
     short = target.rstrip("/").split("/")[-1]
-    ui = build_ui(engine, f"Wiseacre ({short})")
-    print("\nOpening the chat in your browser. Press Ctrl+C here to stop.\n")
+    store = Store(args.data_dir)
+    ui = build_ui(engine, f"Wiseacre ({short})", store)
+    print(f"\nOptions are remembered in {store.root}. Conversations are saved there only if you turn that on.")
+    print("Opening the chat in your browser. Press Ctrl+C here to stop.\n")
     ui.queue().launch(server_name="0.0.0.0" if args.lan else "127.0.0.1",
-                      server_port=args.port, inbrowser=not args.no_browser, share=False)
+                      server_port=args.port, inbrowser=not args.no_browser, share=False, show_api=False)
 
 
 if __name__ == "__main__":
