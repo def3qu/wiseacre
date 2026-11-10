@@ -8,12 +8,23 @@ It picks a Qwen model that fits your computer, opens a chat page in your
 browser, and uses speculative decoding (a small helper model drafts text that
 the main model checks) to make answers appear faster without changing them.
 
+## Download and install
+
+You do not need git or any programming tools. You need Python 3.10 or newer (free from python.org; on Windows, tick "Add python.exe to PATH" in the installer) and about 5 to 70 GB of free disk space, depending on the model chosen for your computer.
+
+1. On this GitHub page, click the green **Code** button, then **Download ZIP**.
+2. Unzip it. On Windows, right-click the file and choose **Extract All**; running the files from inside the zip will not work. On a Mac, just double-click the filename.
+3. Move the unzipped folder somewhere permanent, such as your home folder. Avoid Downloads, because macOS can block Terminal from reading it.
+4. Start it (next section).
+
+Git users can run git clone instead of downloading the zip.
+
 ## Start it
 
 You need Python 3.10 or newer and about 5 to 70 GB of free disk space,
 depending on the model chosen for your computer.
 
-**Mac:** double-click `start.command`. If macOS blocks it, right-click the file,
+**Mac:** double-click `start.command`. If macOS blocks it, right-click (or control-click) the file,
 choose Open, then Open again. You can also run `./start.command` in Terminal.
 
 **Windows:** double-click `start.bat`.
@@ -21,8 +32,7 @@ choose Open, then Open again. You can also run `./start.command` in Terminal.
 **Linux:** run `./start.command` in a terminal.
 
 The first run sets itself up and downloads the model, which can take several
-minutes. After that it starts in under a minute and your browser opens to the
-chat page. Close the window, or press Ctrl+C, to stop it.
+minutes. There will be a lot of things scrolling by on your screen. You can ignore all of them. After that it starts in under a minute and your browser opens to the chat page. Close the window, or press Ctrl+C, to stop it.
 
 Python is free from python.org. On Windows, tick "Add python.exe to PATH" in
 the installer.
@@ -109,11 +119,29 @@ Models are downloaded once from Hugging Face and stored in
 you type is sent anywhere. To block all network use after the first
 download, set the environment variable `HF_HUB_OFFLINE=1`.
 
-## Adding a logo
+## Block all network use (optional)
 
-Save a PNG called `logo.png` in the `assets` folder (create the folder if it is
-missing). It then appears beside the page title and as the browser tab icon.
-A square image with a transparent background works best.
+After the first run has finished downloading the model, you can stop Wiseacre
+from contacting the internet at all. Do not do this before the first run, or
+the download will fail.
+
+**Mac and Linux:** open `start.command` in a plain-text editor (on a Mac,
+right-click it, choose Open With, then TextEdit, then Format and Make Plain
+Text). Add this line directly under the line that starts with `cd`:
+
+```
+export HF_HUB_OFFLINE=1
+```
+
+**Windows:** right-click `start.bat` and choose Edit (it opens in Notepad).
+Add this line directly under the line that starts with `cd`:
+
+```
+set HF_HUB_OFFLINE=1
+```
+
+Save the file and start Wiseacre as usual. To go back online, for example to
+download a different model, delete the line again.
 
 ## How the code is organized
 
